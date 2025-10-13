@@ -13,6 +13,9 @@ from werkzeug.utils import secure_filename
 import subprocess
 import json
 from pathlib import Path
+import pandas as pd
+import numpy as np
+import joblib
 
 # Configuración de upload
 UPLOAD_FOLDER = '/tmp/penal_uploads'
@@ -486,51 +489,51 @@ def search_players():
         
         players = []
         
-        # 1. BUSCAR PRIMERO EN NUESTRA BASE DE DATOS
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
+        # # 1. BUSCAR PRIMERO EN NUESTRA BASE DE DATOS
+        # try:
+        #     conn = get_db_connection()
+        #     cursor = conn.cursor(cursor_factory=RealDictCursor)
             
-            search_pattern = f"%{search_query}%"
-            query = """
-                SELECT 
-                    player_id,
-                    short_name,
-                    name,
-                    lastname,
-                    foot,
-                    'local' as source
-                FROM players
-                WHERE LOWER(name) LIKE LOWER(%s)
-                   OR LOWER(lastname) LIKE LOWER(%s)
-                   OR LOWER(short_name) LIKE LOWER(%s)
-                ORDER BY lastname, name
-                LIMIT 10
-            """
+        #     search_pattern = f"%{search_query}%"
+        #     query = """
+        #         SELECT 
+        #             player_id,
+        #             short_name,
+        #             name,
+        #             lastname,
+        #             foot,
+        #             'local' as source
+        #         FROM players
+        #         WHERE LOWER(name) LIKE LOWER(%s)
+        #            OR LOWER(lastname) LIKE LOWER(%s)
+        #            OR LOWER(short_name) LIKE LOWER(%s)
+        #         ORDER BY lastname, name
+        #         LIMIT 10
+        #     """
             
-            cursor.execute(query, (search_pattern, search_pattern, search_pattern))
-            local_players = cursor.fetchall()
+        #     cursor.execute(query, (search_pattern, search_pattern, search_pattern))
+        #     local_players = cursor.fetchall()
             
-            cursor.close()
-            conn.close()
+        #     cursor.close()
+        #     conn.close()
             
-            # Formatear resultados locales
-            for player in local_players:
-                players.append({
-                    'player_id': player['player_id'],
-                    'name': player['name'] or '',
-                    'lastname': player['lastname'] or '',
-                    'short_name': player['short_name'] or '',
-                    'nationality': '',
-                    'birth_date': '',
-                    'photo': '',
-                    'source': 'local'
-                })
+        #     # Formatear resultados locales
+        #     for player in local_players:
+        #         players.append({
+        #             'player_id': player['player_id'],
+        #             'name': player['name'] or '',
+        #             'lastname': player['lastname'] or '',
+        #             'short_name': player['short_name'] or '',
+        #             'nationality': '',
+        #             'birth_date': '',
+        #             'photo': '',
+        #             'source': 'local'
+        #         })
             
-            print(f"🔍 Encontrados {len(local_players)} jugadores en BD local")
+        #     print(f"🔍 Encontrados {len(local_players)} jugadores en BD local")
             
-        except Exception as e:
-            print(f"⚠️ Error buscando en BD local: {e}")
+        # except Exception as e:
+        #     print(f"⚠️ Error buscando en BD local: {e}")
         
         # 2. SI NO HAY RESULTADOS LOCALES, BUSCAR EN API-FOOTBALL
         if len(players) == 0:
@@ -1347,6 +1350,544 @@ def upload_video_to_s3():
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+# ==================== ENDPOINTS DE PREDICCIÓN ====================
+
+@app.route('/api/prediction/upload-video', methods=['POST'])
+def prediction_upload_video():
+    """Sube un video temporal para predicción"""
+    try:
+        if 'video' not in request.files:
+            return jsonify({'error': 'No se encontró el archivo de video'}), 400
+        
+        file = request.files['video']
+        
+        if file.filename == '':
+            return jsonify({'error': 'No se seleccionó ningún archivo'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Formato de archivo no permitido. Use: mp4, avi, mov, mkv'}), 400
+        
+        # Generar nombre único temporal
+        import uuid
+        temp_id = str(uuid.uuid4())
+        filename = f"prediction_{temp_id}_temp.mp4"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(filepath)
+        
+        # Obtener info del video
+        cap = cv2.VideoCapture(filepath)
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / fps if fps > 0 else 0
+        cap.release()
+        
+        print(f"✅ Video de predicción subido: {filename}")
+        print(f"📊 Info: {width}x{height}, {fps}FPS, {total_frames} frames, {duration:.2f}s")
+        
+        return jsonify({
+            'success': True,
+            'temp_id': temp_id,
+            'filename': filename,
+            'filepath': filepath,
+            'video_info': {
+                'width': width,
+                'height': height,
+                'fps': fps,
+                'total_frames': total_frames,
+                'duration': duration
+            }
+        }), 200
+        
+    except Exception as e:
+        print(f"Error en prediction_upload_video: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/prediction/detect-players', methods=['POST'])
+def prediction_detect_players():
+    """Detecta jugadores en video de predicción usando YOLOv11"""
+    try:
+        data = request.json
+        filepath = data.get('filepath')
+        temp_id = data.get('temp_id')
+        
+        if not filepath or not os.path.exists(filepath):
+            return jsonify({'error': 'Archivo no encontrado'}), 404
+        
+        print(f"🔍 Iniciando detección de jugadores en: {filepath}")
+        
+        # Importar detector
+        import sys
+        sys.path.append(os.path.dirname(__file__))
+        from detector import FootballPlayerDetector
+        
+        # Crear detector
+        detector = FootballPlayerDetector(confidence_threshold=0.4)
+        
+        # Ruta para video procesado
+        processed_video_path = os.path.join(UPLOAD_FOLDER, f"prediction_{temp_id}_detected.mp4")
+        
+        # Procesar video (primera pasada)
+        detected_ids = detector.process_video_first_pass(
+            video_path=filepath,
+            output_path=processed_video_path,
+            show_video=False
+        )
+        
+        # Obtener estadísticas
+        stats = detector.calculate_statistics()
+        
+        # Convertir numpy types a Python natives
+        detected_ids_list = [int(id) for id in detected_ids]
+        stats_serializable = {k: int(v) if isinstance(v, np.integer) else float(v) if isinstance(v, np.floating) else v 
+                             for k, v in stats.items()}
+        
+        print(f"✅ Detección completada. IDs encontrados: {detected_ids_list}")
+        
+        return jsonify({
+            'success': True,
+            'detected_player_ids': detected_ids_list,
+            'stats': stats_serializable,
+            'processed_video_filename': os.path.basename(processed_video_path)
+        }), 200
+        
+    except Exception as e:
+        print(f"Error en prediction_detect_players: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/prediction/extract-and-predict', methods=['POST'])
+def prediction_extract_and_predict():
+    """Extrae posturas y ejecuta predicción ML"""
+    try:
+        data = request.json
+        filepath = data.get('filepath')
+        temp_id = data.get('temp_id')
+        selected_player_ids = data.get('player_ids', [])
+        player_foot = data.get('player_foot')  # 'L' o 'R'
+        
+        if not filepath or not os.path.exists(filepath):
+            return jsonify({'error': 'Archivo no encontrado'}), 404
+        
+        if not selected_player_ids:
+            return jsonify({'error': 'Se requieren IDs de jugadores'}), 400
+        
+        if not player_foot or player_foot not in ['L', 'R']:
+            return jsonify({'error': 'Se requiere pie del jugador (L o R)'}), 400
+        
+        print(f"🦴 Extrayendo landmarks de jugadores: {selected_player_ids}")
+        print(f"👟 Pie del pateador: {player_foot}")
+        
+        # 1. EXTRAER POSTURAS
+        import sys
+        sys.path.append(os.path.dirname(__file__))
+        from detector import FootballPlayerDetector
+        
+        detector = FootballPlayerDetector(confidence_threshold=0.4)
+        
+        # CSV temporal
+        csv_path = os.path.join(UPLOAD_FOLDER, f"prediction_{temp_id}_postures.csv")
+        
+        # Procesar video (segunda pasada)
+        player_usage_stats, total_frames = detector.process_video_second_pass(
+            video_path=filepath,
+            selected_player_ids=selected_player_ids,
+            csv_output_path=csv_path
+        )
+        
+        print(f"✅ Extracción completada. CSV guardado en: {csv_path}")
+        
+        # 2. CARGAR CSV Y PREPARAR DATOS
+        df = pd.read_csv(csv_path)
+        
+        # Renombrar columnas al formato esperado por el modelo
+        column_mapping = {
+            'nose_x': 'NOSE_X', 'nose_y': 'NOSE_Y', 'nose_confidence': 'NOSE_CONFIDENCE',
+            'left_eye_x': 'LEFT_EYE_X', 'left_eye_y': 'LEFT_EYE_Y', 'left_eye_confidence': 'LEFT_EYE_CONFIDENCE',
+            'right_eye_x': 'RIGHT_EYE_X', 'right_eye_y': 'RIGHT_EYE_Y', 'right_eye_confidence': 'RIGHT_EYE_CONFIDENCE',
+            'left_ear_x': 'LEFT_EAR_X', 'left_ear_y': 'LEFT_EAR_Y', 'left_ear_confidence': 'LEFT_EAR_CONFIDENCE',
+            'right_ear_x': 'RIGHT_EAR_X', 'right_ear_y': 'RIGHT_EAR_Y', 'right_ear_confidence': 'RIGHT_EAR_CONFIDENCE',
+            'left_shoulder_x': 'LEFT_SHOULDER_X', 'left_shoulder_y': 'LEFT_SHOULDER_Y', 'left_shoulder_confidence': 'LEFT_SHOULDER_CONFIDENCE',
+            'right_shoulder_x': 'RIGHT_SHOULDER_X', 'right_shoulder_y': 'RIGHT_SHOULDER_Y', 'right_shoulder_confidence': 'RIGHT_SHOULDER_CONFIDENCE',
+            'left_elbow_x': 'LEFT_ELBOW_X', 'left_elbow_y': 'LEFT_ELBOW_Y', 'left_elbow_confidence': 'LEFT_ELBOW_CONFIDENCE',
+            'right_elbow_x': 'RIGHT_ELBOW_X', 'right_elbow_y': 'RIGHT_ELBOW_Y', 'right_elbow_confidence': 'RIGHT_ELBOW_CONFIDENCE',
+            'left_wrist_x': 'LEFT_WRIST_X', 'left_wrist_y': 'LEFT_WRIST_Y', 'left_wrist_confidence': 'LEFT_WRIST_CONFIDENCE',
+            'right_wrist_x': 'RIGHT_WRIST_X', 'right_wrist_y': 'RIGHT_WRIST_Y', 'right_wrist_confidence': 'RIGHT_WRIST_CONFIDENCE',
+            'left_hip_x': 'LEFT_HIP_X', 'left_hip_y': 'LEFT_HIP_Y', 'left_hip_confidence': 'LEFT_HIP_CONFIDENCE',
+            'right_hip_x': 'RIGHT_HIP_X', 'right_hip_y': 'RIGHT_HIP_Y', 'right_hip_confidence': 'RIGHT_HIP_CONFIDENCE',
+            'left_knee_x': 'LEFT_KNEE_X', 'left_knee_y': 'LEFT_KNEE_Y', 'left_knee_confidence': 'LEFT_KNEE_CONFIDENCE',
+            'right_knee_x': 'RIGHT_KNEE_X', 'right_knee_y': 'RIGHT_KNEE_Y', 'right_knee_confidence': 'RIGHT_KNEE_CONFIDENCE',
+            'left_ankle_x': 'LEFT_ANKLE_X', 'left_ankle_y': 'LEFT_ANKLE_Y', 'left_ankle_confidence': 'LEFT_ANKLE_CONFIDENCE',
+            'right_ankle_x': 'RIGHT_ANKLE_X', 'right_ankle_y': 'RIGHT_ANKLE_Y', 'right_ankle_confidence': 'RIGHT_ANKLE_CONFIDENCE',
+            'frame': 'FRAME'
+        }
+        df = df.rename(columns=column_mapping)
+        df['PLAYER_FOOT'] = player_foot
+        
+        # 3. FEATURE ENGINEERING
+        print("🔧 Aplicando feature engineering...")
+        engineered_features = df.apply(engineer_features_per_frame, axis=1)
+        df_with_features = pd.concat([df, engineered_features], axis=1)
+        
+        # 4. CARGAR MODELOS
+        print("📦 Cargando modelos ML...")
+        models_path = os.path.join(os.path.dirname(__file__), 'models')
+        
+        model_height = joblib.load(os.path.join(models_path, 'model_height.joblib'))
+        model_side = joblib.load(os.path.join(models_path, 'model_side.joblib'))
+        le_height = joblib.load(os.path.join(models_path, 'label_encoder_height.joblib'))
+        le_side = joblib.load(os.path.join(models_path, 'label_encoder_side.joblib'))
+        le_foot = joblib.load(os.path.join(models_path, 'label_encoder_foot.joblib'))
+        
+        with open(os.path.join(models_path, 'feature_columns.json'), 'r') as f:
+            feature_columns = json.load(f)
+        
+        # ENCODEAR PLAYER_FOOT CON MANEJO ROBUSTO
+        try:
+            print(f"👟 Procesando pie del jugador: {player_foot}")
+            print(f"🔍 Clases del encoder: {le_foot.classes_}")
+            print(f"🔍 Tipo de clases: {type(le_foot.classes_[0])}")
+            
+            # Verificar si el encoder usa strings o números
+            first_class = le_foot.classes_[0]
+            
+            if isinstance(first_class, str):
+                # El encoder espera strings directamente
+                print(f"✅ Encoder usa strings, transformando directamente...")
+                df_with_features['PLAYER_FOOT_ENCODED'] = le_foot.transform(df_with_features['PLAYER_FOOT'])
+                print(f"✅ Transformación directa exitosa: {player_foot} -> {df_with_features['PLAYER_FOOT_ENCODED'].iloc[0]}")
+                
+            elif isinstance(first_class, (int, np.integer)):
+                # El encoder usa números - necesitamos mapear manualmente
+                print(f"⚠️ Encoder usa números, aplicando mapeo manual...")
+                
+                # Mapeo estándar: L=0, R=1, B=2 (si existe)
+                foot_mapping = {'L': 0, 'R': 1}
+                if len(le_foot.classes_) > 2:
+                    foot_mapping['B'] = 2
+                
+                print(f"📋 Mapeo aplicado: {foot_mapping}")
+                
+                encoded_value = foot_mapping.get(player_foot)
+                if encoded_value is None:
+                    raise ValueError(f"Pie '{player_foot}' no está en el mapeo: {foot_mapping}")
+                
+                df_with_features['PLAYER_FOOT_ENCODED'] = encoded_value
+                print(f"✅ PLAYER_FOOT_ENCODED = {encoded_value}")
+                
+            else:
+                # Tipo desconocido, usar mapeo por defecto
+                print(f"⚠️ Tipo de clase desconocido: {type(first_class)}, usando mapeo por defecto")
+                foot_mapping = {'L': 0, 'R': 1, 'B': 2}
+                encoded_value = foot_mapping.get(player_foot, 0)
+                df_with_features['PLAYER_FOOT_ENCODED'] = encoded_value
+                print(f"✅ Usando valor por defecto: {encoded_value}")
+        
+        except Exception as e:
+            print(f"❌ Error crítico al encodear PLAYER_FOOT: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback seguro: asumir L=0, R=1
+            print("⚠️ Aplicando fallback seguro: L=0, R=1")
+            fallback_map = {'L': 0, 'R': 1, 'B': 2}
+            encoded_value = fallback_map.get(player_foot, 0)
+            df_with_features['PLAYER_FOOT_ENCODED'] = encoded_value
+            print(f"✅ Fallback aplicado: {player_foot} -> {encoded_value}")
+        
+        # 5. PREPARAR DATOS PARA PREDICCIÓN
+        print(f"📋 Preparando features: {len(feature_columns)} columnas esperadas")
+        X_pred = df_with_features[feature_columns]
+        X_pred = X_pred.replace([np.inf, -np.inf], np.nan).fillna(0)
+        print(f"✅ Dataset preparado: {X_pred.shape}")
+        
+        # 6. PREDICCIONES
+        print("🎯 Realizando predicciones...")
+        y_height_pred_encoded = model_height.predict(X_pred)
+        y_height_pred = le_height.inverse_transform(y_height_pred_encoded)
+        
+        y_side_pred_encoded = model_side.predict(X_pred)
+        y_side_pred = le_side.inverse_transform(y_side_pred_encoded)
+        
+        y_height_proba = model_height.predict_proba(X_pred)
+        y_side_proba = model_side.predict_proba(X_pred)
+        
+        height_confidence = y_height_proba.max(axis=1)
+        side_confidence = y_side_proba.max(axis=1)
+        
+        # 7. ANÁLISIS DE RESULTADOS
+        results_frames = pd.DataFrame({
+            'FRAME': df_with_features['FRAME'],
+            'PREDICTED_HEIGHT': y_height_pred,
+            'HEIGHT_CONFIDENCE': height_confidence,
+            'PREDICTED_SIDE': y_side_pred,
+            'SIDE_CONFIDENCE': side_confidence
+        })
+        
+        # Probabilidades promedio por clase
+        height_classes = le_height.classes_
+        side_classes = le_side.classes_
+        
+        height_probabilities = {}
+        for idx, cls in enumerate(height_classes):
+            height_probabilities[cls] = float(y_height_proba[:, idx].mean())
+        
+        side_probabilities = {}
+        for idx, cls in enumerate(side_classes):
+            side_probabilities[cls] = float(y_side_proba[:, idx].mean())
+        
+        # Distribución de frecuencias
+        total_frames_count = len(results_frames)
+        
+        height_distribution = {}
+        for cls in height_classes:
+            count = int((results_frames['PREDICTED_HEIGHT'] == cls).sum())
+            height_distribution[cls] = {
+                'count': count,
+                'percentage': float(count / total_frames_count * 100)
+            }
+        
+        side_distribution = {}
+        for cls in side_classes:
+            count = int((results_frames['PREDICTED_SIDE'] == cls).sum())
+            side_distribution[cls] = {
+                'count': count,
+                'percentage': float(count / total_frames_count * 100)
+            }
+        
+        # Predicción final (votación mayoritaria)
+        final_height = results_frames['PREDICTED_HEIGHT'].mode()[0]
+        final_side = results_frames['PREDICTED_SIDE'].mode()[0]
+        
+        final_height_confidence = float(results_frames[results_frames['PREDICTED_HEIGHT'] == final_height]['HEIGHT_CONFIDENCE'].mean())
+        final_side_confidence = float(results_frames[results_frames['PREDICTED_SIDE'] == final_side]['SIDE_CONFIDENCE'].mean())
+        
+        final_height_votes = int((results_frames['PREDICTED_HEIGHT'] == final_height).sum())
+        final_side_votes = int((results_frames['PREDICTED_SIDE'] == final_side).sum())
+        
+        # Confianza global
+        global_confidence = float((final_height_confidence + final_side_confidence) / 2)
+        
+        # Consistencia
+        height_consistency = float(final_height_votes / total_frames_count)
+        side_consistency = float(final_side_votes / total_frames_count)
+        
+        # Predicciones por frame (primeros 100 para no saturar)
+        frame_predictions = results_frames.head(100).to_dict('records')
+        
+        # Limpiar archivos temporales
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                print(f"🗑️ Eliminado: {filepath}")
+            if os.path.exists(csv_path):
+                os.remove(csv_path)
+                print(f"🗑️ Eliminado: {csv_path}")
+            processed_video = os.path.join(UPLOAD_FOLDER, f"prediction_{temp_id}_detected.mp4")
+            if os.path.exists(processed_video):
+                os.remove(processed_video)
+                print(f"🗑️ Eliminado: {processed_video}")
+        except Exception as e:
+            print(f"⚠️ Error al eliminar archivos temporales: {e}")
+        
+        print("✅ Predicción completada exitosamente")
+        
+        return jsonify({
+            'success': True,
+            'total_frames': int(total_frames_count),
+            'player_foot': player_foot,
+            'height_probabilities': height_probabilities,
+            'side_probabilities': side_probabilities,
+            'height_distribution': height_distribution,
+            'side_distribution': side_distribution,
+            'final_prediction': {
+                'height': final_height,
+                'height_confidence': final_height_confidence,
+                'height_votes': final_height_votes,
+                'height_percentage': float(final_height_votes / total_frames_count * 100),
+                'side': final_side,
+                'side_confidence': final_side_confidence,
+                'side_votes': final_side_votes,
+                'side_percentage': float(final_side_votes / total_frames_count * 100),
+                'global_confidence': global_confidence
+            },
+            'consistency': {
+                'height': height_consistency,
+                'side': side_consistency
+            },
+            'frame_predictions': frame_predictions
+        }), 200
+        
+    except Exception as e:
+        print(f"Error en prediction_extract_and_predict: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+# Funciones auxiliares para feature engineering (del predict.py)
+def calculate_angle(p1_x, p1_y, p2_x, p2_y, p3_x, p3_y):
+    vector1 = np.array([p1_x - p2_x, p1_y - p2_y])
+    vector2 = np.array([p3_x - p2_x, p3_y - p2_y])
+    norm1 = np.linalg.norm(vector1)
+    norm2 = np.linalg.norm(vector2)
+    if norm1 == 0 or norm2 == 0:
+        return 0
+    cos_angle = np.dot(vector1, vector2) / (norm1 * norm2)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    return np.degrees(np.arccos(cos_angle))
+
+def calculate_distance(x1, y1, x2, y2):
+    return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+def engineer_features_per_frame(frame_df):
+    features = {}
+    
+    # Ángulos
+    features['left_elbow_angle'] = calculate_angle(
+        frame_df['LEFT_SHOULDER_X'], frame_df['LEFT_SHOULDER_Y'],
+        frame_df['LEFT_ELBOW_X'], frame_df['LEFT_ELBOW_Y'],
+        frame_df['LEFT_WRIST_X'], frame_df['LEFT_WRIST_Y']
+    )
+    features['right_elbow_angle'] = calculate_angle(
+        frame_df['RIGHT_SHOULDER_X'], frame_df['RIGHT_SHOULDER_Y'],
+        frame_df['RIGHT_ELBOW_X'], frame_df['RIGHT_ELBOW_Y'],
+        frame_df['RIGHT_WRIST_X'], frame_df['RIGHT_WRIST_Y']
+    )
+    features['left_knee_angle'] = calculate_angle(
+        frame_df['LEFT_HIP_X'], frame_df['LEFT_HIP_Y'],
+        frame_df['LEFT_KNEE_X'], frame_df['LEFT_KNEE_Y'],
+        frame_df['LEFT_ANKLE_X'], frame_df['LEFT_ANKLE_Y']
+    )
+    features['right_knee_angle'] = calculate_angle(
+        frame_df['RIGHT_HIP_X'], frame_df['RIGHT_HIP_Y'],
+        frame_df['RIGHT_KNEE_X'], frame_df['RIGHT_KNEE_Y'],
+        frame_df['RIGHT_ANKLE_X'], frame_df['RIGHT_ANKLE_Y']
+    )
+    features['hip_angle'] = calculate_angle(
+        frame_df['LEFT_SHOULDER_X'], frame_df['LEFT_SHOULDER_Y'],
+        frame_df['LEFT_HIP_X'], frame_df['LEFT_HIP_Y'],
+        frame_df['LEFT_KNEE_X'], frame_df['LEFT_KNEE_Y']
+    )
+    features['left_shoulder_angle'] = calculate_angle(
+        frame_df['LEFT_ELBOW_X'], frame_df['LEFT_ELBOW_Y'],
+        frame_df['LEFT_SHOULDER_X'], frame_df['LEFT_SHOULDER_Y'],
+        frame_df['LEFT_HIP_X'], frame_df['LEFT_HIP_Y']
+    )
+    features['right_shoulder_angle'] = calculate_angle(
+        frame_df['RIGHT_ELBOW_X'], frame_df['RIGHT_ELBOW_Y'],
+        frame_df['RIGHT_SHOULDER_X'], frame_df['RIGHT_SHOULDER_Y'],
+        frame_df['RIGHT_HIP_X'], frame_df['RIGHT_HIP_Y']
+    )
+    
+    # Distancias
+    features['shoulder_width'] = calculate_distance(
+        frame_df['LEFT_SHOULDER_X'], frame_df['LEFT_SHOULDER_Y'],
+        frame_df['RIGHT_SHOULDER_X'], frame_df['RIGHT_SHOULDER_Y']
+    )
+    features['hip_width'] = calculate_distance(
+        frame_df['LEFT_HIP_X'], frame_df['LEFT_HIP_Y'],
+        frame_df['RIGHT_HIP_X'], frame_df['RIGHT_HIP_Y']
+    )
+    features['feet_distance'] = calculate_distance(
+        frame_df['LEFT_ANKLE_X'], frame_df['LEFT_ANKLE_Y'],
+        frame_df['RIGHT_ANKLE_X'], frame_df['RIGHT_ANKLE_Y']
+    )
+    
+    avg_ankle_y = (frame_df['LEFT_ANKLE_Y'] + frame_df['RIGHT_ANKLE_Y']) / 2
+    features['body_height'] = abs(frame_df['NOSE_Y'] - avg_ankle_y)
+    
+    features['left_arm_length'] = (
+        calculate_distance(frame_df['LEFT_SHOULDER_X'], frame_df['LEFT_SHOULDER_Y'],
+                         frame_df['LEFT_ELBOW_X'], frame_df['LEFT_ELBOW_Y']) +
+        calculate_distance(frame_df['LEFT_ELBOW_X'], frame_df['LEFT_ELBOW_Y'],
+                         frame_df['LEFT_WRIST_X'], frame_df['LEFT_WRIST_Y'])
+    )
+    features['right_arm_length'] = (
+        calculate_distance(frame_df['RIGHT_SHOULDER_X'], frame_df['RIGHT_SHOULDER_Y'],
+                         frame_df['RIGHT_ELBOW_X'], frame_df['RIGHT_ELBOW_Y']) +
+        calculate_distance(frame_df['RIGHT_ELBOW_X'], frame_df['RIGHT_ELBOW_Y'],
+                         frame_df['RIGHT_WRIST_X'], frame_df['RIGHT_WRIST_Y'])
+    )
+    features['left_leg_length'] = (
+        calculate_distance(frame_df['LEFT_HIP_X'], frame_df['LEFT_HIP_Y'],
+                         frame_df['LEFT_KNEE_X'], frame_df['LEFT_KNEE_Y']) +
+        calculate_distance(frame_df['LEFT_KNEE_X'], frame_df['LEFT_KNEE_Y'],
+                         frame_df['LEFT_ANKLE_X'], frame_df['LEFT_ANKLE_Y'])
+    )
+    features['right_leg_length'] = (
+        calculate_distance(frame_df['RIGHT_HIP_X'], frame_df['RIGHT_HIP_Y'],
+                         frame_df['RIGHT_KNEE_X'], frame_df['RIGHT_KNEE_Y']) +
+        calculate_distance(frame_df['RIGHT_KNEE_X'], frame_df['RIGHT_KNEE_Y'],
+                         frame_df['RIGHT_ANKLE_X'], frame_df['RIGHT_ANKLE_Y'])
+    )
+    
+    # Posiciones relativas
+    center_x = (frame_df['LEFT_HIP_X'] + frame_df['RIGHT_HIP_X']) / 2
+    center_y = (frame_df['LEFT_HIP_Y'] + frame_df['RIGHT_HIP_Y']) / 2
+    features['nose_deviation_x'] = frame_df['NOSE_X'] - center_x
+    features['nose_deviation_y'] = frame_df['NOSE_Y'] - center_y
+    features['left_wrist_deviation_x'] = frame_df['LEFT_WRIST_X'] - center_x
+    features['right_wrist_deviation_x'] = frame_df['RIGHT_WRIST_X'] - center_x
+    
+    # Ratios
+    features['hip_shoulder_ratio'] = features['hip_width'] / features['shoulder_width'] if features['shoulder_width'] > 0 else 0
+    
+    # Confianza
+    confidence_cols = [col for col in frame_df.index if 'CONFIDENCE' in col]
+    features['avg_confidence'] = frame_df[confidence_cols].mean()
+    features['min_confidence'] = frame_df[confidence_cols].min()
+    
+    return pd.Series(features)
+
+@app.route('/api/players/<int:player_id>/penalties', methods=['GET'])
+def get_player_penalties(player_id):
+    """Obtiene todos los penales de un jugador específico"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        query = """
+            SELECT 
+                p.penalty_id,
+                p.fixture_id,
+                p.minute,
+                p.extra_minute,
+                p.event,
+                p.condition,
+                p.penalty_shootout,
+                p.height,
+                p.side,
+                l.name as league_name,
+                l.season,
+                st.name as shooter_team_name,
+                dt.name as defender_team_name
+            FROM penalties p
+            LEFT JOIN leagues l ON p.league_id = l.league_id AND p.season = l.season
+            LEFT JOIN teams st ON p.shooter_team_id = st.team_id
+            LEFT JOIN teams dt ON p.defender_team_id = dt.team_id
+            WHERE p.player_id = %s
+            ORDER BY l.season DESC, p.penalty_id DESC
+        """
+        
+        cursor.execute(query, (player_id,))
+        penalties = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify(penalties), 200
+        
+    except Exception as e:
+        print(f"Error en get_player_penalties: {e}")
+        return jsonify({
+            'error': 'Error al obtener penales del jugador',
+            'message': str(e)
+        }), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
