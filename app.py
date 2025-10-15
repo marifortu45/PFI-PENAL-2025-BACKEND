@@ -16,6 +16,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import joblib
+import pickle
+import time
 
 # Configuración de upload
 UPLOAD_FOLDER = '/tmp/penal_uploads'
@@ -1888,6 +1890,750 @@ def get_player_penalties(player_id):
             'error': 'Error al obtener penales del jugador',
             'message': str(e)
         }), 500
+
+# ==================== SISTEMA DE SUGERENCIAS ML ====================
+
+# Cache para análisis de jugadores (evita recalcular)
+player_analysis_cache = {}
+CACHE_EXPIRY_SECONDS = 300  # 5 minutos
+
+def get_player_analysis_from_cache(player_id):
+    """Obtiene análisis del cache si existe y no expiró"""
+    if player_id in player_analysis_cache:
+        cached_data, timestamp = player_analysis_cache[player_id]
+        if (time.time() - timestamp) < CACHE_EXPIRY_SECONDS:
+            print(f"📦 Usando cache para jugador {player_id}")
+            return cached_data
+    return None
+
+def save_player_analysis_to_cache(player_id, data):
+    """Guarda análisis en cache"""
+    import time
+    player_analysis_cache[player_id] = (data, time.time())
+    print(f"💾 Guardado en cache para jugador {player_id}")
+
+@app.route('/api/players/<int:player_id>/analysis', methods=['GET'])
+def get_player_analysis(player_id):
+    """Genera análisis ML completo de un jugador específico"""
+    try:
+        # Verificar cache
+        cached = get_player_analysis_from_cache(player_id)
+        if cached:
+            return jsonify(cached), 200
+        
+        print(f"🎯 Generando análisis ML para jugador {player_id}...")
+        
+        # 1. OBTENER DATOS DEL JUGADOR DESDE LA BD
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Query modificada para un jugador específico
+        query = """
+            SELECT
+                pk.penalty_id, pk.fixture_id, pk.league_id, pk.season, pk.event, 
+                pk.minute, pk.extra_minute, pk.shooter_team_id, pk.defender_team_id, 
+                pk.player_id, pk.condition, pk.penalty_shootout, pk.height, pk.side,
+                ps.frame, ps.nose_x, ps.nose_y, ps.nose_confidence,
+                ps.left_eye_x, ps.left_eye_y, ps.left_eye_confidence,
+                ps.right_eye_x, ps.right_eye_y, ps.right_eye_confidence,
+                ps.left_ear_x, ps.left_ear_y, ps.left_ear_confidence,
+                ps.right_ear_x, ps.right_ear_y, ps.right_ear_confidence,
+                ps.left_shoulder_x, ps.left_shoulder_y, ps.left_shoulder_confidence,
+                ps.right_shoulder_x, ps.right_shoulder_y, ps.right_shoulder_confidence,
+                ps.left_elbow_x, ps.left_elbow_y, ps.left_elbow_confidence,
+                ps.right_elbow_x, ps.right_elbow_y, ps.right_elbow_confidence,
+                ps.left_wrist_x, ps.left_wrist_y, ps.left_wrist_confidence,
+                ps.right_wrist_x, ps.right_wrist_y, ps.right_wrist_confidence,
+                ps.left_hip_x, ps.left_hip_y, ps.left_hip_confidence,
+                ps.right_hip_x, ps.right_hip_y, ps.right_hip_confidence,
+                ps.left_knee_x, ps.left_knee_y, ps.left_knee_confidence,
+                ps.right_knee_x, ps.right_knee_y, ps.right_knee_confidence,
+                ps.left_ankle_x, ps.left_ankle_y, ps.left_ankle_confidence,
+                ps.right_ankle_x, ps.right_ankle_y, ps.right_ankle_confidence,
+                tms.name AS shooter_team_name,
+                tmd.name AS defender_team_name,
+                ply.short_name, ply.foot, ply.name, ply.lastname,
+                lg.name AS league_name
+            FROM public.penalties AS pk
+            JOIN public.postures AS ps ON pk.penalty_id = ps.penalty_id
+            JOIN public.teams AS tms ON pk.shooter_team_id = tms.team_id
+            JOIN public.teams AS tmd ON pk.defender_team_id = tmd.team_id
+            JOIN public.players AS ply ON pk.player_id = ply.player_id
+            JOIN public.leagues AS lg ON pk.league_id = lg.league_id AND pk.season = lg.season
+            WHERE ply.player_id = %s
+            ORDER BY pk.penalty_id, ps.frame
+        """
+        
+        cursor.execute(query, (player_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not rows:
+            return jsonify({'error': f'No se encontraron datos para el jugador {player_id}'}), 404
+        
+        # Convertir a DataFrame
+        df = pd.DataFrame(rows)
+        
+        # Renombrar columnas a formato esperado
+        df.columns = [col.upper() for col in df.columns]
+        
+        print(f"📊 Cargados {len(df)} frames de {df['PENALTY_ID'].nunique()} penales")
+        
+        # 2. EXTRAER FEATURES POR PENAL
+        print("🔧 Extrayendo features...")
+        features_data = extract_features_from_dataframe(df)
+        
+        if len(features_data) == 0:
+            return jsonify({'error': 'No se pudieron extraer features'}), 500
+        
+        print(f"✅ Features extraídas de {len(features_data)} penales")
+        
+        # 3. CARGAR MODELO ML
+        print("🤖 Cargando modelo ML...")
+        models_path = os.path.join(os.path.dirname(__file__), 'models')
+        model_file = os.path.join(models_path, 'penalty_model.pkl')
+        
+        if not os.path.exists(model_file):
+            return jsonify({'error': 'Modelo ML no encontrado. Entrena el modelo primero.'}), 500
+        
+        with open(model_file, 'rb') as f:
+            model_data = pickle.load(f)
+        
+        side_model = model_data['side_model']
+        height_model = model_data['height_model']
+        side_encoder = model_data['side_encoder']
+        height_encoder = model_data['height_encoder']
+        feature_columns = model_data['feature_columns']
+        
+        # 4. ANALIZAR PATRONES DEL JUGADOR
+        print("🔍 Analizando patrones...")
+        patterns = analyze_player_patterns(features_data, player_id)
+        
+        # 5. HACER PREDICCIÓN CON EL ÚLTIMO PENAL COMO REFERENCIA
+        print("🎯 Generando predicción...")
+        last_penalty_features = features_data.iloc[[-1]]
+        
+        # Preparar datos para predicción
+        X = last_penalty_features[feature_columns].replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+        # Predicciones
+        side_pred_encoded = side_model.predict(X)[0]
+        side_pred = side_encoder.inverse_transform([side_pred_encoded])[0]
+        side_proba = side_model.predict_proba(X)[0]
+        
+        height_pred_encoded = height_model.predict(X)[0]
+        height_pred = height_encoder.inverse_transform([height_pred_encoded])[0]
+        height_proba = height_model.predict_proba(X)[0]
+        
+        # Crear diccionarios de probabilidades
+        side_probabilities = {
+            label: float(prob)
+            for label, prob in zip(side_encoder.classes_, side_proba)
+        }
+        
+        height_probabilities = {
+            label: float(prob)
+            for label, prob in zip(height_encoder.classes_, height_proba)
+        }
+        
+        predictions = {
+            'side_prediction': side_pred,
+            'side_probabilities': side_probabilities,
+            'height_prediction': height_pred,
+            'height_probabilities': height_probabilities
+        }
+        
+        # 6. GENERAR SUGERENCIAS
+        print("💡 Generando sugerencias...")
+        suggestions = generate_goalkeeper_suggestions(patterns, predictions)
+        
+        # 7. CONSTRUIR RESPUESTA
+        response = {
+            'player_id': player_id,
+            'player_name': patterns['player_name'],
+            'total_penalties': patterns['total_penalties'],
+            'patterns': patterns,
+            'predictions': predictions,
+            'suggestions': suggestions
+        }
+        
+        # Guardar en cache
+        save_player_analysis_to_cache(player_id, response)
+        
+        print(f"✅ Análisis completado para {patterns['player_name']}")
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        print(f"❌ Error en get_player_analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+def extract_features_from_dataframe(df):
+    """Extrae features de un DataFrame con datos de penales"""
+    penalty_features = []
+    
+    for penalty_id, penalty_group in df.groupby('PENALTY_ID'):
+        features = extract_sequence_features(penalty_group)
+        
+        # Agregar metadata
+        first_row = penalty_group.iloc[0]
+        features['PENALTY_ID'] = int(penalty_id)
+        features['PLAYER_ID'] = int(first_row['PLAYER_ID'])
+        features['SIDE'] = first_row['SIDE']
+        features['HEIGHT'] = first_row['HEIGHT']
+        features['EVENT'] = first_row['EVENT']
+        features['PLAYER_FOOT'] = first_row.get('FOOT', 'Unknown')
+        features['PLAYER_NAME'] = first_row.get('SHORT_NAME', 'Unknown')
+        
+        penalty_features.append(features)
+    
+    return pd.DataFrame(penalty_features)
+
+
+def extract_sequence_features(penalty_df):
+    """Extrae features de una secuencia de un penal"""
+    features = {}
+    
+    # 1. Features temporales básicas
+    features['num_frames'] = len(penalty_df)
+    features['valid_frames'] = penalty_df['NOSE_X'].notna().sum()
+    
+    # 2. Centro de masa
+    com_features = extract_center_of_mass_features(penalty_df)
+    features.update(com_features)
+    
+    # 3. Velocidad
+    velocity_features = extract_velocity_features(penalty_df)
+    features.update(velocity_features)
+    
+    # 4. Ángulos
+    angle_features = extract_angle_features(penalty_df)
+    features.update(angle_features)
+    
+    # 5. Características de carrera
+    run_features = extract_run_characteristics(penalty_df)
+    features.update(run_features)
+    
+    # 6. Postura
+    posture_features = extract_posture_features(penalty_df)
+    features.update(posture_features)
+    
+    # 7. Extremidades
+    limb_features = extract_limb_movement(penalty_df)
+    features.update(limb_features)
+    
+    return features
+
+
+def extract_center_of_mass_features(df):
+    """Calcula características del centro de masa"""
+    features = {}
+    
+    com_x = (df['LEFT_SHOULDER_X'] + df['RIGHT_SHOULDER_X'] + 
+             df['LEFT_HIP_X'] + df['RIGHT_HIP_X']) / 4
+    com_y = (df['LEFT_SHOULDER_Y'] + df['RIGHT_SHOULDER_Y'] + 
+             df['LEFT_HIP_Y'] + df['RIGHT_HIP_Y']) / 4
+    
+    valid_com = com_x.notna() & com_y.notna()
+    
+    if valid_com.sum() > 1:
+        com_x_valid = com_x[valid_com]
+        com_y_valid = com_y[valid_com]
+        
+        features['com_displacement_x'] = abs(com_x_valid.iloc[-1] - com_x_valid.iloc[0])
+        features['com_displacement_y'] = abs(com_y_valid.iloc[-1] - com_y_valid.iloc[0])
+        features['com_total_displacement'] = np.sqrt(
+            features['com_displacement_x']**2 + features['com_displacement_y']**2
+        )
+        features['com_std_x'] = com_x_valid.std()
+        features['com_std_y'] = com_y_valid.std()
+    else:
+        features['com_displacement_x'] = 0
+        features['com_displacement_y'] = 0
+        features['com_total_displacement'] = 0
+        features['com_std_x'] = 0
+        features['com_std_y'] = 0
+    
+    return features
+
+
+def extract_velocity_features(df):
+    """Calcula velocidades y aceleraciones"""
+    features = {}
+    
+    com_x = (df['LEFT_SHOULDER_X'] + df['RIGHT_SHOULDER_X']) / 2
+    com_y = (df['LEFT_SHOULDER_Y'] + df['RIGHT_SHOULDER_Y']) / 2
+    
+    valid_mask = com_x.notna() & com_y.notna()
+    
+    if valid_mask.sum() > 2:
+        com_x_valid = com_x[valid_mask].values
+        com_y_valid = com_y[valid_mask].values
+        
+        vel_x = np.diff(com_x_valid)
+        vel_y = np.diff(com_y_valid)
+        vel_magnitude = np.sqrt(vel_x**2 + vel_y**2)
+        
+        features['avg_velocity'] = np.mean(vel_magnitude)
+        features['max_velocity'] = np.max(vel_magnitude)
+        features['min_velocity'] = np.min(vel_magnitude)
+        features['velocity_std'] = np.std(vel_magnitude)
+        
+        if len(vel_magnitude) > 1:
+            acceleration = np.diff(vel_magnitude)
+            features['avg_acceleration'] = np.mean(np.abs(acceleration))
+            features['max_acceleration'] = np.max(np.abs(acceleration))
+    else:
+        features['avg_velocity'] = 0
+        features['max_velocity'] = 0
+        features['min_velocity'] = 0
+        features['velocity_std'] = 0
+        features['avg_acceleration'] = 0
+        features['max_acceleration'] = 0
+    
+    return features
+
+
+def calculate_angle_3points(p1_x, p1_y, p2_x, p2_y, p3_x, p3_y):
+    """Calcula ángulo entre tres puntos"""
+    if pd.isna([p1_x, p1_y, p2_x, p2_y, p3_x, p3_y]).any():
+        return np.nan
+    
+    v1 = np.array([p1_x - p2_x, p1_y - p2_y])
+    v2 = np.array([p3_x - p2_x, p3_y - p2_y])
+    
+    cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+    cos_angle = np.clip(cos_angle, -1, 1)
+    angle = np.arccos(cos_angle) * 180 / np.pi
+    
+    return angle
+
+
+def extract_angle_features(df):
+    """Extrae ángulos corporales"""
+    features = {}
+    
+    # Ángulo del torso
+    torso_angles = []
+    for idx, row in df.iterrows():
+        if pd.notna([row['NOSE_X'], row['NOSE_Y'], 
+                    row['LEFT_HIP_X'], row['LEFT_HIP_Y']]).all():
+            dx = row['NOSE_X'] - (row['LEFT_HIP_X'] + row['RIGHT_HIP_X']) / 2
+            dy = row['NOSE_Y'] - (row['LEFT_HIP_Y'] + row['RIGHT_HIP_Y']) / 2
+            angle = np.arctan2(abs(dx), abs(dy)) * 180 / np.pi
+            torso_angles.append(angle)
+    
+    if torso_angles:
+        features['torso_angle_mean'] = np.mean(torso_angles)
+        features['torso_angle_std'] = np.std(torso_angles)
+        features['torso_angle_max'] = np.max(torso_angles)
+    else:
+        features['torso_angle_mean'] = 0
+        features['torso_angle_std'] = 0
+        features['torso_angle_max'] = 0
+    
+    # Ángulos de rodilla
+    knee_angles = []
+    for idx, row in df.iterrows():
+        angle_r = calculate_angle_3points(
+            row['RIGHT_HIP_X'], row['RIGHT_HIP_Y'],
+            row['RIGHT_KNEE_X'], row['RIGHT_KNEE_Y'],
+            row['RIGHT_ANKLE_X'], row['RIGHT_ANKLE_Y']
+        )
+        if not np.isnan(angle_r):
+            knee_angles.append(angle_r)
+        
+        angle_l = calculate_angle_3points(
+            row['LEFT_HIP_X'], row['LEFT_HIP_Y'],
+            row['LEFT_KNEE_X'], row['LEFT_KNEE_Y'],
+            row['LEFT_ANKLE_X'], row['LEFT_ANKLE_Y']
+        )
+        if not np.isnan(angle_l):
+            knee_angles.append(angle_l)
+    
+    if knee_angles:
+        features['knee_angle_mean'] = np.mean(knee_angles)
+        features['knee_angle_std'] = np.std(knee_angles)
+        features['knee_angle_min'] = np.min(knee_angles)
+    else:
+        features['knee_angle_mean'] = 0
+        features['knee_angle_std'] = 0
+        features['knee_angle_min'] = 0
+    
+    return features
+
+
+def extract_run_characteristics(df):
+    """Analiza características de la carrera"""
+    features = {}
+    
+    com_x = (df['LEFT_ANKLE_X'] + df['RIGHT_ANKLE_X']) / 2
+    valid_mask = com_x.notna()
+    
+    if valid_mask.sum() > 3:
+        com_x_valid = com_x[valid_mask].values
+        velocities = np.diff(com_x_valid)
+        
+        velocity_changes = np.diff(velocities)
+        
+        if len(velocity_changes) > 0:
+            # Convertir numpy bool a Python int
+            features['has_pause'] = int(np.any(velocity_changes < -np.std(velocity_changes) * 2))
+            features['num_velocity_changes'] = int(np.sum(np.abs(velocity_changes) > np.std(velocity_changes)))
+        else:
+            features['has_pause'] = 0
+            features['num_velocity_changes'] = 0
+        
+        step_distances = np.abs(velocities)
+        features['avg_step_length'] = float(np.mean(step_distances))
+        features['step_length_std'] = float(np.std(step_distances))
+    else:
+        features['has_pause'] = 0
+        features['num_velocity_changes'] = 0
+        features['avg_step_length'] = 0.0
+        features['step_length_std'] = 0.0
+    
+    return features
+
+
+def extract_posture_features(df):
+    """Extrae features de postura"""
+    features = {}
+    
+    shoulder_widths = np.sqrt(
+        (df['LEFT_SHOULDER_X'] - df['RIGHT_SHOULDER_X'])**2 +
+        (df['LEFT_SHOULDER_Y'] - df['RIGHT_SHOULDER_Y'])**2
+    )
+    features['shoulder_width_mean'] = shoulder_widths.mean()
+    
+    body_heights = []
+    for idx, row in df.iterrows():
+        if pd.notna([row['NOSE_Y'], row['LEFT_ANKLE_Y'], row['RIGHT_ANKLE_Y']]).all():
+            height = row['NOSE_Y'] - (row['LEFT_ANKLE_Y'] + row['RIGHT_ANKLE_Y']) / 2
+            body_heights.append(abs(height))
+    
+    if body_heights:
+        features['body_height_mean'] = np.mean(body_heights)
+        features['body_height_std'] = np.std(body_heights)
+    else:
+        features['body_height_mean'] = 0
+        features['body_height_std'] = 0
+    
+    return features
+
+
+def extract_limb_movement(df):
+    """Analiza movimiento de extremidades"""
+    features = {}
+    
+    left_wrist_movement = np.sqrt(
+        df['LEFT_WRIST_X'].diff()**2 + df['LEFT_WRIST_Y'].diff()**2
+    )
+    right_wrist_movement = np.sqrt(
+        df['RIGHT_WRIST_X'].diff()**2 + df['RIGHT_WRIST_Y'].diff()**2
+    )
+    
+    features['left_arm_movement'] = left_wrist_movement.mean()
+    features['right_arm_movement'] = right_wrist_movement.mean()
+    features['arm_movement_asymmetry'] = abs(
+        left_wrist_movement.mean() - right_wrist_movement.mean()
+    )
+    
+    left_ankle_movement = np.sqrt(
+        df['LEFT_ANKLE_X'].diff()**2 + df['LEFT_ANKLE_Y'].diff()**2
+    )
+    right_ankle_movement = np.sqrt(
+        df['RIGHT_ANKLE_X'].diff()**2 + df['RIGHT_ANKLE_Y'].diff()**2
+    )
+    
+    features['left_leg_movement'] = left_ankle_movement.mean()
+    features['right_leg_movement'] = right_ankle_movement.mean()
+    
+    return features
+
+
+def analyze_player_patterns(features_df, player_id):
+    """Analiza patrones de un jugador"""
+    patterns = {
+        'player_id': player_id,
+        'total_penalties': len(features_df),
+        'player_name': features_df.iloc[0].get('PLAYER_NAME', 'Unknown')
+    }
+    
+    # Dirección preferida
+    patterns['direction_patterns'] = analyze_direction_patterns(features_df)
+    
+    # Altura preferida
+    patterns['height_patterns'] = analyze_height_patterns(features_df)
+    
+    # Características de carrera
+    patterns['run_characteristics'] = analyze_run_patterns(features_df)
+    
+    # Postura
+    patterns['posture_patterns'] = analyze_posture_patterns(features_df)
+    
+    # Velocidad
+    patterns['velocity_patterns'] = analyze_velocity_patterns(features_df)
+    
+    # Brazos
+    patterns['arm_patterns'] = analyze_arm_patterns(features_df)
+    
+    # Tasa de éxito
+    patterns['success_rate'] = calculate_success_rate(features_df)
+    
+    return patterns
+
+
+def analyze_direction_patterns(df):
+    """Analiza patrones de dirección"""
+    direction_counts = df['SIDE'].value_counts()
+    total = len(df)
+    
+    patterns = {
+        'preferred_side': direction_counts.idxmax() if len(direction_counts) > 0 else 'Unknown',
+        'side_distribution': direction_counts.to_dict(),
+        'side_percentages': (direction_counts / total * 100).to_dict()
+    }
+    
+    max_percentage = (direction_counts.max() / total * 100) if total > 0 else 0
+    if max_percentage > 70:
+        patterns['consistency'] = 'Muy predecible'
+    elif max_percentage > 50:
+        patterns['consistency'] = 'Moderadamente predecible'
+    else:
+        patterns['consistency'] = 'Impredecible/variado'
+    
+    return patterns
+
+
+def analyze_height_patterns(df):
+    """Analiza patrones de altura"""
+    height_counts = df['HEIGHT'].value_counts()
+    total = len(df)
+    
+    return {
+        'preferred_height': height_counts.idxmax() if len(height_counts) > 0 else 'Unknown',
+        'height_distribution': height_counts.to_dict(),
+        'height_percentages': (height_counts / total * 100).to_dict()
+    }
+
+
+def analyze_run_patterns(df):
+    """Analiza características de la carrera"""
+    patterns = {}
+    
+    if 'has_pause' in df.columns:
+        pause_rate = df['has_pause'].mean() * 100
+        patterns['pause_frequency'] = f"{pause_rate:.0f}%"
+        patterns['uses_pause'] = bool(pause_rate > 30)  # Convertir a Python bool
+    
+    if 'num_frames' in df.columns:
+        avg_frames = df['num_frames'].mean()
+        if avg_frames > 150:
+            patterns['run_length'] = 'Carrera larga'
+        elif avg_frames > 100:
+            patterns['run_length'] = 'Carrera media'
+        else:
+            patterns['run_length'] = 'Carrera corta'
+    
+    if 'avg_velocity' in df.columns:
+        avg_vel = df['avg_velocity'].mean()
+        if avg_vel > df['avg_velocity'].median():
+            patterns['approach_speed'] = 'Rápida'
+        else:
+            patterns['approach_speed'] = 'Lenta/controlada'
+        
+        vel_std = df['avg_velocity'].std()
+        if vel_std < avg_vel * 0.3:
+            patterns['speed_consistency'] = 'Velocidad consistente'
+        else:
+            patterns['speed_consistency'] = 'Velocidad variable'
+    
+    if 'num_velocity_changes' in df.columns:  # ← CORREGIDO AQUÍ
+        avg_changes = df['num_velocity_changes'].mean()  # ← CORREGIDO AQUÍ
+        if avg_changes > 5:
+            patterns['rhythm_changes'] = 'Múltiples cambios de ritmo'
+        elif avg_changes > 2:
+            patterns['rhythm_changes'] = 'Algunos cambios de ritmo'
+        else:
+            patterns['rhythm_changes'] = 'Ritmo constante'
+    
+    return patterns
+
+
+def analyze_posture_patterns(df):
+    """Analiza patrones de postura"""
+    patterns = {}
+    
+    if 'torso_angle_mean' in df.columns:
+        avg_torso = df['torso_angle_mean'].mean()
+        if avg_torso > 30:
+            patterns['torso_lean'] = 'Se inclina considerablemente'
+        elif avg_torso > 15:
+            patterns['torso_lean'] = 'Inclinación moderada'
+        else:
+            patterns['torso_lean'] = 'Postura erguida'
+    
+    if 'knee_angle_mean' in df.columns:
+        avg_knee = df['knee_angle_mean'].mean()
+        if avg_knee < 140:
+            patterns['knee_bend'] = 'Flexión de rodillas pronunciada'
+        elif avg_knee < 160:
+            patterns['knee_bend'] = 'Flexión moderada'
+        else:
+            patterns['knee_bend'] = 'Piernas relativamente extendidas'
+    
+    if 'body_height_std' in df.columns:
+        height_var = df['body_height_std'].mean()
+        if height_var > 10:
+            patterns['body_movement'] = 'Mucho movimiento vertical'
+        else:
+            patterns['body_movement'] = 'Centro de gravedad estable'
+    
+    return patterns
+
+
+def analyze_velocity_patterns(df):
+    """Analiza patrones de velocidad"""
+    patterns = {}
+    
+    if 'max_velocity' in df.columns and 'avg_velocity' in df.columns:
+        avg_max_vel = df['max_velocity'].mean()
+        avg_avg_vel = df['avg_velocity'].mean()
+        
+        acceleration_ratio = avg_max_vel / (avg_avg_vel + 1e-6)
+        
+        if acceleration_ratio > 2:
+            patterns['acceleration_pattern'] = 'Acelera mucho al final'
+        elif acceleration_ratio > 1.5:
+            patterns['acceleration_pattern'] = 'Acelera progresivamente'
+        else:
+            patterns['acceleration_pattern'] = 'Velocidad constante'
+    
+    return patterns
+
+
+def analyze_arm_patterns(df):
+    """Analiza movimiento de brazos"""
+    patterns = {}
+    
+    if 'left_arm_movement' in df.columns and 'right_arm_movement' in df.columns:
+        avg_left = df['left_arm_movement'].mean()
+        avg_right = df['right_arm_movement'].mean()
+        
+        if 'arm_movement_asymmetry' in df.columns:
+            avg_asym = df['arm_movement_asymmetry'].mean()
+            if avg_asym > 2:
+                patterns['arm_balance'] = 'Movimiento asimétrico de brazos'
+            else:
+                patterns['arm_balance'] = 'Movimiento balanceado de brazos'
+        
+        total_arm_movement = avg_left + avg_right
+        if total_arm_movement > 10:
+            patterns['arm_movement'] = 'Movimiento amplio de brazos'
+        else:
+            patterns['arm_movement'] = 'Brazos relativamente quietos'
+    
+    return patterns
+
+
+def calculate_success_rate(df):
+    """Calcula tasa de éxito"""
+    if 'EVENT' in df.columns:
+        success_count = (df['EVENT'] == 'Goal').sum()
+        total = len(df)
+        success_rate = (success_count / total * 100) if total > 0 else 0
+        
+        return {
+            'success_rate': float(success_rate),
+            'successful': int(success_count),
+            'missed': int(total - success_count),
+            'total': int(total)
+        }
+    
+    return {'success_rate': 0, 'successful': 0, 'missed': 0, 'total': 0}
+
+
+def generate_goalkeeper_suggestions(patterns, predictions):
+    """Genera sugerencias para el arquero"""
+    suggestions = []
+    
+    # Basado en consistencia
+    dir_patterns = patterns.get('direction_patterns', {})
+    consistency = dir_patterns.get('consistency', '')
+    preferred = dir_patterns.get('preferred_side', '')
+    
+    if consistency == 'Muy predecible':
+        side_map = {'Left': 'izquierda', 'Right': 'derecha', 'Center': 'centro'}
+        suggestions.append({
+            'type': 'direction',
+            'priority': 'high',
+            'text': f"Cubre tu {side_map.get(preferred, '')} con prioridad - el jugador es muy consistente"
+        })
+    
+    # Basado en pausa
+    run = patterns.get('run_characteristics', {})
+    if run.get('uses_pause', False):
+        suggestions.append({
+'type': 'pause',
+            'priority': 'high',
+            'text': 'Mantente firme si hace pausa - no te anticipes'
+        })
+        suggestions.append({
+            'type': 'timing',
+            'priority': 'medium',
+            'text': 'Espera el último momento para decidir tu movimiento'
+        })
+    
+    # Basado en velocidad
+    if run.get('approach_speed') == 'Rápida':
+        suggestions.append({
+            'type': 'speed',
+            'priority': 'medium',
+            'text': 'Prepárate temprano - su aproximación es rápida'
+        })
+    
+    # Basado en inclinación
+    posture = patterns.get('posture_patterns', {})
+    if 'considerable' in posture.get('torso_lean', '').lower():
+        suggestions.append({
+            'type': 'posture',
+            'priority': 'medium',
+            'text': 'Observa la inclinación del torso para anticipar dirección'
+        })
+    
+    # Basado en predicción
+    side_probs = predictions.get('side_probabilities', {})
+    max_prob = max(side_probs.values()) if side_probs else 0
+    
+    if max_prob < 0.4:
+        suggestions.append({
+            'type': 'uncertainty',
+            'priority': 'low',
+            'text': 'La predicción es incierta - confía en tu intuición y experiencia'
+        })
+    
+    # Basado en tasa de conversión
+    success = patterns.get('success_rate', {})
+    if success.get('success_rate', 0) > 80:
+        suggestions.append({
+            'type': 'alert',
+            'priority': 'high',
+            'text': 'Alto índice de conversión - máxima concentración requerida'
+        })
+    
+    if not suggestions:
+        suggestions.append({
+            'type': 'general',
+            'priority': 'low',
+            'text': 'Mantén tu posición natural y reacciona a sus movimientos'
+        })
+    
+    return suggestions
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
